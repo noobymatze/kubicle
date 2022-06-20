@@ -1,0 +1,244 @@
+* Kubernetes
+  
+  This document contains every step I took and some notes on what I
+  learned along the way. So, this is a living document. It does not
+  contain all the knowledge about Kubernetes and there will be
+  mistakes and stuff, which won't work.
+ 
+** Opinions & Unknowns
+   
+*** Adding multiple hosts to a cluster?
+    
+    Seems like it is a microk8s add-node away, but there are probably
+    potential problems, that I am not aware of. Also, the K8 scheduler
+    may then start to move containers between hosts, which I am not
+    sure, is a good idea with our typical application.
+    
+*** Is this really worth it?
+    
+    My angle and perspective on K8 is, that I am tired of having to
+    setup the exact same stuff for deploying a basic web app with
+    Kotlin on a bare metal server. 
+
+    I want to be able to deploy our typical application with a single
+    command, provided a domain has been registered. I am not
+    interested in managing letsencrypt certificates, nginx
+    configurations, firewalls and taking care, that no new person
+    makes the same mistakes as me.
+
+    Howver, this problem, can be solved with ansible or other
+    provisioning tools as well. What they cannot solve is scaling an
+    application. However, the ability to scale horizontally probably
+    requires applications to be written a somewhat specific way.
+
+   
+*** Version management and builds?
+*** TODO Registry with harbor?
+*** TODO How is a failed Deployment handled?
+*** TODO Should you really handle this cluster yourself?
+ 
+
+** Critical opinions
+
+   - https://news.ycombinator.com/item?id=31796301
+  
+** Glossary
+   
+   This chapter contains short definitions of names.
+
+   - A /Pod/ is a conglomeration of multiple containers. Typically,
+     one of them is the main one and others are /Sidecars/, which
+     handle metrics, backups or other concerns.
+   - /Ingress/ is an abstraction layer on top of reverse
+     proxies. NGINX and HAProxy can be used as implementations.
+   - A /Service/ groups multiple instances of pods of the same type
+     and routes requests to said pods.
+   - /Ingress/ is a reverse proxy.
+
+** Installing microk8s
+   
+   Installing an auto-updating Kubernetes distribution can be done
+   using the following commands, taken from [[https://microk8s.io/docs/getting-started][here]].
+
+   #+BEGIN_SRC bash
+   $ apt install snapd
+   $ snap install microk8s --classic --channel=latest/stable
+   $ microk8s enable dns helm3 ingress
+   #+END_SRC
+   
+   Note: The [[https://microk8s.io/docs/setting-snap-channel][channel]] defines how the auto-update behaves. In this
+   case, it will always update to the latest stable version. Since
+   this includes jumping between major versions, it may break
+   something.
+   
+   An alternative to microk8s would be https://k3s.io/, which is more
+   suited to run for IoT devices.
+
+** Adding aliases
+   
+   To run anything with the cluster, you need to use `microk8s
+   kubectl` and microk8s helm3 all the time. To shorten that, add an
+   alias to your ~/.bash_aliases.
+   
+   #+BEGIN_SRC bash
+   alias kubectl='microk8s kubectl'
+   alias helm='microk8s helm3'
+   #+END_SRC
+   
+** Simple echo server
+   
+   Setting up a simple echo server can be done with the following
+   configuration file. You need to change the domain.
+   
+   *Note:* If you installed Ingress via helm, you might need to change
+   the kubernetes.io/ingress.class: public to another value.
+
+   #+BEGIN_SRC yaml
+   # Copy to echo-server.yml
+   apiVersion: apps/v1
+   kind: Deployment
+   metadata:
+     name: echo
+     labels:
+       app: echo
+   spec:
+     selector:
+       matchLabels:
+         app: echo
+     replicas: 1
+     template:
+       metadata:
+         labels:
+           app: echo
+       spec:
+         containers:
+           - name: echo
+             image: hashicorp/http-echo
+             args: ['--listen', ':5678', '--text', 'echo']
+             ports:
+               - containerPort: 5678
+   ---
+   apiVersion: v1
+   kind: Service
+   metadata:
+     name: echo
+     labels:
+       app: echo
+   spec:
+     ports:
+       - port: 80
+         targetPort: 5678
+         name: echo
+     selector:
+       app: echo
+   ---
+   apiVersion: networking.k8s.io/v1
+   kind: Ingress
+   metadata:
+     name: echo
+     labels:
+       app: echo
+     annotations:
+       kubernetes.io/ingress.class: public
+   spec:
+     rules:
+       - host: foo.io
+         http:
+           paths:
+             - path: /
+               pathType: Prefix
+               backend:
+                 service:
+                   name: echo
+                   port:
+                     name: echo
+   #+END_SRC
+   
+** Let's Encrypt
+   
+   To setup letsencrypt, we need a cert-manager. There are many ways
+   to install it, we can either use helm or kubectl.
+   
+   #+BEGIN_SRC bash
+   $ kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.8.0/cert-manager.yaml
+   #+END_SRC
+   
+   This sets up the certmanager extension in kubernetes and some other
+   stuff.
+   
+   Now we need to create a cluster issuer, which we will be using to
+   create all our certificates.
+   
+   #+BEGIN_SRC yaml
+   apiVersion: cert-manager.io/v1
+   kind: ClusterIssuer
+   metadata:
+     name: letsencrypt
+   spec:
+     acme:
+       # You must replace this email address with your own.
+       # Let's Encrypt will use this to contact you about expiring
+       # certificates, and issues related to your account.
+       email: example@foo
+       server: https://acme-v02.api.letsencrypt.org/directory
+       privateKeySecretRef:
+         # Secret resource that will be used to store the account's private key.
+         name: somewhere-issuer-account-key
+       # Add a single challenge solver, HTTP01 using nginx
+       solvers:
+       - http01:
+           ingress:
+             class: public
+   #+END_SRC
+   
+   Now for using the issuer. The following yaml file can be used to
+   issue a certificate with a given name and for the DNS entries.
+   
+   *Note*: It is important to set the kind of the issuerRef to
+   ClusterIssuer, otherwise you would have to create a custom issuer.
+   
+   #+BEGIN_SRC yaml
+   apiVersion: cert-manager.io/v1
+   kind: Certificate
+   metadata:
+     name: foo-io
+   spec:
+     secretName: foo-io-tls
+     issuerRef:
+       name: letsencrypt-cluster-issuer
+       kind: ClusterIssuer
+     commonName: foo.io
+     dnsNames:
+     - foo.io
+   #+END_SRC
+
+   Now we have a valid certificate. This only needs to be used in our 
+   actual application.
+   
+   #+BEGIN_SRC yaml
+   apiVersion: networking.k8s.io/v1
+   kind: Ingress
+   metadata:
+     name: echo
+     labels:
+       app: echo
+     annotations:
+       kubernetes.io/ingress.class: public
+   spec:
+     tls:
+     - hosts:
+       - foo.io
+       secretName: foo-io-tls
+     rules:
+       - host: foo.io
+         http:
+           paths:
+             - path: /
+               pathType: Prefix
+               backend:
+                 service:
+                   name: echo
+                   port:
+                     name: echo
+   #+END_SRC
+** TODO Installing PostgresSQL
